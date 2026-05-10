@@ -41,14 +41,19 @@ dataset/
   labels/train/                   YOLO pose annotations (.txt)
   labels/val/                     YOLO pose annotations (.txt)
   dataset.yaml
+  real/images/                    Real webcam captures for fine-tuning
+  real/labels/                    Hand-annotated YOLO pose labels (CVAT export)
+  real_dataset.yaml
 runs/
-  run_100/weights/best.pt         Trained model (6.5 MB)
+  run_100/weights/best.pt         Synthetic-trained model
+  run_finetune/weights/best.pt    Fine-tuned on real images (active model)
 scripts/
   inspect_stl_dimensions.py       Print STL bounding box dimensions (Blender)
   generate_dataset.py             Generate the full synthetic training dataset (Blender)
   split_train_val.py              Move 10% of train images → val
-  train.py                        Train YOLOv8n-pose for 100 epochs
-  run_pose_estimation.py          Real-time pose estimation from webcam
+  capture_real_images.py          Capture real webcam images for annotation
+  train.py                        Train or fine-tune YOLOv8n-pose
+  run_pose_estimation.py          Real-time 6-DoF pose estimation from webcam
 tests/
   render_single_image.py          Render one test image to check the pipeline (Blender)
   verify_pose_on_synthetic.py     Verify YOLO + solvePnP on a known Blender render
@@ -85,7 +90,7 @@ The calibration is used both by Blender (to match the render FOV to the real cam
 blender --background --python scripts/generate_dataset.py
 ```
 
-This script places the phone at the origin, moves a virtual camera to random positions on a hemisphere (distance 150–1000 mm, elevation 5–85°), and renders each frame with Cycles + OptiX. For each render it:
+This script fixes the phone flat (screen face down) at the origin and orbits a virtual camera around it — full 360° azimuth, 10–80° elevation, 150–350 mm distance — rendering with Cycles + OptiX. For each render it:
 1. Projects the 8 bounding box corners to pixel coordinates using `world_to_camera_view`
 2. Marks each keypoint as visible (facing camera) or occluded (back face) using face normal dot product
 3. Writes a YOLO pose label file alongside the image
@@ -93,10 +98,9 @@ This script places the phone at the origin, moves a virtual camera to random pos
 Key settings in the script:
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `NUM_RENDERS` | 1000 | Images to generate |
-| `RENDER_SAMPLES` | 64 | Cycles render samples (quality) |
-| `MIN/MAX_DISTANCE_MM` | 150–1000 mm | Camera distance range |
-| `MIN/MAX_ELEVATION_DEG` | 5–85° | Camera elevation range |
+| `NUM_RENDERS` | 100 | Images to generate |
+| `RENDER_SAMPLES` | 256 | Cycles render samples (quality) |
+| `MIN/MAX_DISTANCE_MM` | 150–350 mm | Camera distance range |
 
 Takes about 15 minutes with RTX 4060 + OptiX.
 
@@ -115,9 +119,11 @@ Result: ~900 train, ~100 val (exact numbers depend on how many renders succeeded
 python3 scripts/train.py
 ```
 
-Uses YOLOv8n-pose (nano, ~3M parameters) with 100 epochs, batch 16, image size 640.
+Two-stage training:
 
-**Training results (run_100, RTX 4060, 8.7 minutes):**
+**Stage 1 — synthetic pre-training (`run_100`)**
+
+Train YOLOv8n-pose from scratch on ~1000 synthetic Blender renders. 100 epochs, batch 16, image size 640, `lr0=0.01`.
 
 | Epoch | pose_loss | Pose mAP50 |
 |-------|-----------|------------|
@@ -127,6 +133,12 @@ Uses YOLOv8n-pose (nano, ~3M parameters) with 100 epochs, batch 16, image size 6
 | 100   | 0.31      | 0.994      |
 
 Model saved to `runs/run_100/weights/best.pt`.
+
+**Stage 2 — real-image fine-tuning (`run_finetune`)**
+
+Fine-tune `run_100/best.pt` on ~20 hand-annotated real webcam photos. 50 epochs, batch 8, `lr0=0.001` (lower to preserve synthetic knowledge). Configure `train.py` to point `DATASET_CONFIG` at `real_dataset.yaml` and `BASE_MODEL` at `run_100/weights/best.pt`.
+
+Model saved to `runs/run_finetune/weights/best.pt` — this is the active model used by `run_pose_estimation.py`.
 
 ### 6. Verify on a synthetic image
 
@@ -147,8 +159,16 @@ python3 scripts/run_pose_estimation.py
 ```
 
 Opens webcam index 2 (change `CAMERA_INDEX` at the top of the file if needed).
-Detections below 75% confidence are skipped.
-Displays axes drawn on the phone and prints pose + timing to the terminal at 1 Hz.
+Detections below 30% confidence are skipped.
+
+Each frame:
+1. YOLO detects 8 keypoints (2D corners)
+2. `solvePnP` (EPNP solver) recovers rvec + tvec from the 2D–3D correspondences
+3. The solution is validated by reprojection error (< 15 px) and distance (5 cm – 2 m)
+4. The pose is smoothed over the last 10 frames to reduce jitter
+5. The phone's 6-DoF coordinate frame axes are drawn on the object (red=X, green=Y, blue=Z)
+
+Translation (x, y, z in metres) and rotation (axis-angle in degrees) are printed to the terminal at 1 Hz.
 
 ---
 
@@ -189,13 +209,11 @@ The order here must match exactly between the Blender render script, the YOLO an
 
 ## Known Limitations
 
-1. **Jitter** — the detected keypoints fluctuate frame to frame, so the pose output is noisy. Temporal smoothing (averaging rvec/tvec over the last N frames) would help.
+1. **Limited real training data** — fine-tuning used only ~20 real photos. More diverse real images (different lighting, backgrounds, angles) would improve robustness.
 
-2. **Domain gap** — the model was trained entirely on synthetic Blender renders, which look different from real photos (lighting, texture, background). Performance on real cameras is noticeably worse than on synthetic test images. Fine-tuning with a small set of real photos would close this gap.
+2. **No upside-down detection** — the training camera always looks at the phone from above (elevation 10–80°). The model has not seen the phone from below.
 
-3. **No upside-down detection** — the training camera always looks at the phone from above (elevation 5–85°). The model has never seen the phone upside-down or from below.
-
-4. **False detections** — the model occasionally detects the phone where there is none. The 0.75 confidence threshold helps filter these out.
+3. **Thin object depth ambiguity** — the phone is only 7.65 mm thick, so the 8 corners are nearly coplanar. The EPNP solver handles this well, but depth (Z) estimation is less accurate than X/Y translation.
 
 ---
 

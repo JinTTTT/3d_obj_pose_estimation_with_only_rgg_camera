@@ -8,15 +8,16 @@ Run with:
 import cv2
 import numpy as np
 import time
+from collections import deque
 from pathlib import Path
 from ultralytics import YOLO
 
 CAMERA_INDEX         = 2
 ROOT                 = Path(__file__).resolve().parents[1]
 CALIBRATION_PATH     = ROOT / "config" / "camera_calibration.yaml"
-MODEL_WEIGHTS_PATH   = ROOT / "runs" / "run_100" / "weights" / "best.pt"
+MODEL_WEIGHTS_PATH   = ROOT / "runs" / "run_finetune" / "weights" / "best.pt"
 
-CONFIDENCE_THRESHOLD = 0.75
+CONFIDENCE_THRESHOLD = 0.3
 
 
 def load_camera_calibration(path):
@@ -63,14 +64,19 @@ def main():
     webcam = cv2.VideoCapture(CAMERA_INDEX)
     webcam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    webcam.set(cv2.CAP_PROP_FPS, 30)
 
     print("Controls:  q or Esc to quit")
     last_console_print_time = 0.0
 
-    # Timing accumulators for inference reporting
-    yolo_times   = []
-    pnp_times    = []
-    frame_times  = []
+    # Temporal smoothing — average last N poses to reduce jitter
+    SMOOTH_N   = 10
+    rvec_queue = deque(maxlen=SMOOTH_N)
+    tvec_queue = deque(maxlen=SMOOTH_N)
+
+    # Timing
+    yolo_times  = []
+    pnp_times   = []
     last_frame_time = time.perf_counter()
 
     while True:
@@ -79,7 +85,7 @@ def main():
             break
 
         now = time.perf_counter()
-        frame_times.append(now - last_frame_time)
+        fps = 1.0 / max(now - last_frame_time, 1e-6)
         last_frame_time = now
 
         # ── Step 1: run YOLO to detect keypoints ──────────────────────────────
@@ -88,66 +94,76 @@ def main():
         yolo_times.append(time.perf_counter() - t0)
 
         if detections.keypoints is not None and len(detections.keypoints) > 0:
-            for keypoint_detection, bounding_box in zip(detections.keypoints, detections.boxes):
+            # Only process the single highest-confidence detection
+            best_idx           = int(detections.boxes.conf.argmax())
+            bounding_box       = detections.boxes[best_idx]
+            keypoint_detection = detections.keypoints[best_idx]
 
-                if float(bounding_box.conf) < CONFIDENCE_THRESHOLD:
-                    continue
-
-                # detected_corners_2d shape: (8, 2) — pixel positions of 8 keypoints
+            if float(bounding_box.conf) >= CONFIDENCE_THRESHOLD:
                 detected_corners_2d = keypoint_detection.xy[0].cpu().numpy().astype(np.float32)
 
-                # Skip if any keypoint is at (0, 0) — means YOLO couldn't find it
-                if np.any(np.all(detected_corners_2d == 0, axis=1)):
-                    continue
+                if not np.any(np.all(detected_corners_2d == 0, axis=1)):
 
-                # ── Step 2: solvePnP ──────────────────────────────────────────
-                t1 = time.perf_counter()
-                success, rvec, tvec = cv2.solvePnP(
-                    phone_corners_3d,
-                    detected_corners_2d,
-                    camera_matrix,
-                    dist_coeffs,
-                    flags=cv2.SOLVEPNP_ITERATIVE,
-                )
-                pnp_times.append(time.perf_counter() - t1)
+                    # ── Step 2: solvePnP ──────────────────────────────────────
+                    t1 = time.perf_counter()
+                    success, rvec, tvec = cv2.solvePnP(
+                        phone_corners_3d,
+                        detected_corners_2d,
+                        camera_matrix,
+                        dist_coeffs,
+                        flags=cv2.SOLVEPNP_EPNP,
+                    )
+                    pnp_times.append(time.perf_counter() - t1)
 
-                if not success:
-                    continue
+                    # Validate with reprojection error — reject bad solutions
+                    if success:
+                        reproj, _ = cv2.projectPoints(
+                            phone_corners_3d, rvec, tvec, camera_matrix, dist_coeffs
+                        )
+                        reproj_error = np.mean(np.linalg.norm(
+                            reproj.reshape(-1, 2) - detected_corners_2d, axis=1
+                        ))
+                        success = reproj_error < 15.0
 
-                # ── Step 3: draw axes on the phone ────────────────────────────
-                cv2.drawFrameAxes(
-                    frame, camera_matrix, dist_coeffs, rvec, tvec,
-                    0.03,  # axis length = 3 cm
-                )
+                    distance = np.linalg.norm(tvec) if success else 0
+                    if success and 0.05 < distance < 2.0:
 
-                for i, (px, py) in enumerate(detected_corners_2d):
-                    cv2.circle(frame, (int(px), int(py)), 4, (0, 255, 0), -1)
-                    cv2.putText(frame, str(i), (int(px) + 5, int(py) - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                        # ── Step 3: smooth pose over last N frames ────────────
+                        rvec_queue.append(rvec.copy())
+                        tvec_queue.append(tvec.copy())
+                        rvec = np.mean(rvec_queue, axis=0)
+                        tvec = np.mean(tvec_queue, axis=0)
 
-                translation = tvec.ravel()
-                rotation_deg = np.degrees(rvec.ravel())
+                        # ── Step 4: draw object coordinate frame axes ─────────
+                        # drawFrameAxes draws the phone's own X/Y/Z axes in the scene
+                        cv2.drawFrameAxes(
+                            frame, camera_matrix, dist_coeffs, rvec, tvec, 0.04
+                        )
 
-                cv2.putText(frame,
-                            f"t: x={translation[0]:.3f} y={translation[1]:.3f} z={translation[2]:.3f} m",
-                            (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame,
-                            f"r: {rotation_deg[0]:.1f} {rotation_deg[1]:.1f} {rotation_deg[2]:.1f} deg",
-                            (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        for i, (px, py) in enumerate(detected_corners_2d):
+                            cv2.circle(frame, (int(px), int(py)), 4, (0, 255, 0), -1)
+                            cv2.putText(frame, str(i), (int(px) + 5, int(py) - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
-                if now - last_console_print_time > 1.0:
-                    avg_yolo_ms  = np.mean(yolo_times) * 1000  if yolo_times  else 0
-                    avg_pnp_ms   = np.mean(pnp_times)  * 1000  if pnp_times   else 0
-                    avg_fps      = 1.0 / np.mean(frame_times)   if frame_times else 0
+                        translation  = tvec.ravel()
+                        rotation_deg = np.degrees(rvec.ravel())
 
-                    print(f"tvec [m]: x={translation[0]:.4f} y={translation[1]:.4f} z={translation[2]:.4f}")
-                    print(f"rvec [deg]: {rotation_deg[0]:.2f} {rotation_deg[1]:.2f} {rotation_deg[2]:.2f}")
-                    print(f"Timing — YOLO: {avg_yolo_ms:.1f} ms  PnP: {avg_pnp_ms:.2f} ms  FPS: {avg_fps:.1f}\n")
+                        cv2.putText(frame,
+                                    f"t: x={translation[0]:.3f} y={translation[1]:.3f} z={translation[2]:.3f} m",
+                                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(frame,
+                                    f"r: {rotation_deg[0]:.1f} {rotation_deg[1]:.1f} {rotation_deg[2]:.1f} deg",
+                                    (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                    yolo_times.clear()
-                    pnp_times.clear()
-                    frame_times.clear()
-                    last_console_print_time = now
+                        if now - last_console_print_time > 1.0:
+                            avg_yolo_ms = np.mean(yolo_times) * 1000 if yolo_times else 0
+                            avg_pnp_ms  = np.mean(pnp_times)  * 1000 if pnp_times  else 0
+                            print(f"tvec [m]: x={translation[0]:.4f} y={translation[1]:.4f} z={translation[2]:.4f}")
+                            print(f"rvec [deg]: {rotation_deg[0]:.2f} {rotation_deg[1]:.2f} {rotation_deg[2]:.2f}")
+                            print(f"Timing — YOLO: {avg_yolo_ms:.1f} ms  PnP: {avg_pnp_ms:.2f} ms  FPS: {fps:.1f}\n")
+                            yolo_times.clear()
+                            pnp_times.clear()
+                            last_console_print_time = now
 
         cv2.imshow("iPhone pose estimation", frame)
         if cv2.waitKey(1) & 0xFF in (ord("q"), 27):

@@ -1,0 +1,8 @@
+path: /home/jtao/workspace/object_detection_ws/3d_obj_pose_estimation_with_yolo_and_pnp/dataset/real
+train: images
+val:   images
+
+nc: 1
+names: ["iphone"]
+
+kpt_shape: [8, 3]

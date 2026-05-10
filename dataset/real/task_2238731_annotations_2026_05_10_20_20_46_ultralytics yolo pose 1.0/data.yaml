@@ -1,0 +1,7 @@
+kpt_shape:
+- 8
+- 3
+names:
+  0: iphone
+path: .
+train: train.txt

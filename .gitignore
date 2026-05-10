@@ -2,13 +2,22 @@
 dataset/images/
 dataset/labels/
 
-# YOLO training artifacts — keep only the final weights
-runs/run_100/weights/last.pt
-runs/run_100/*.png
-runs/run_100/*.csv
-runs/run_100/args.yaml
-runs/run_100/train_batch*.jpg
-runs/run_100/val_batch*.jpg
+# Real images and annotations are small enough to track
+!dataset/real/
+!dataset/real/images/
+!dataset/real/images/**
+!dataset/real/labels/
+!dataset/real/labels/**
+
+# Model weights
+*.pt
+
+# YOLO training artifacts
+runs/**/*.png
+runs/**/*.csv
+runs/**/args.yaml
+runs/**/train_batch*.jpg
+runs/**/val_batch*.jpg
 
 # Python
 __pycache__/

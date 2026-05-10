@@ -7,18 +7,20 @@ Run with:
 
 from ultralytics import YOLO
 
-DATASET_CONFIG = "/home/jtao/workspace/object_detection_ws/3d_obj_pose_estimation_with_yolo_and_pnp/dataset/dataset.yaml"
+DATASET_CONFIG = "/home/jtao/workspace/object_detection_ws/3d_obj_pose_estimation_with_yolo_and_pnp/dataset/real_dataset.yaml"
+BASE_MODEL     = "/home/jtao/workspace/object_detection_ws/3d_obj_pose_estimation_with_yolo_and_pnp/runs/run_100/weights/best.pt"
 
-# yolov8n-pose.pt = nano (smallest, fastest) — good for testing
-# yolov8s-pose.pt = small — better accuracy, use for real training
-yolo_model = YOLO("yolov8n-pose.pt")
+# Fine-tune the synthetic-trained model on real images only.
+# Lower lr so we don't destroy what the model already learned.
+yolo_model = YOLO(BASE_MODEL)
 
 yolo_model.train(
     data    = DATASET_CONFIG,
-    epochs  = 100,
+    epochs  = 50,
     imgsz   = 640,
-    batch   = 16,
+    batch   = 8,
     device  = 0,
+    lr0     = 0.001,
     project = "/home/jtao/workspace/object_detection_ws/3d_obj_pose_estimation_with_yolo_and_pnp/runs",
-    name    = "run_100",
+    name    = "run_finetune",
 )
