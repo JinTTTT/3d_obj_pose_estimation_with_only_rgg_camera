@@ -1,0 +1,21 @@
+%YAML:1.0
+---
+image_width: 640
+image_height: 480
+chessboard_inner_corners_x: 9
+chessboard_inner_corners_y: 6
+square_size_m: 0.0235
+rms_reprojection_error: 0.82116040426815018
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 676.6783093862939, 0., 345.791590155059, 0.,
+       677.34065534778176, 236.50755030088411, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ 0.011215320039831446, 0.24883914158248135,
+       -0.0043973811458632084, 0.0063539830740433024,
+       -0.38640364348240563 ]
